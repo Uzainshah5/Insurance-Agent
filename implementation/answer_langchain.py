@@ -21,11 +21,14 @@ from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 
 load_dotenv(override=True)
 
-# Where the Chroma database is saved (same folder as before)
+# Where the Chroma database is saved
 DB_NAME = str(Path(__file__).parent.parent / "preprocessed_db")
 
 COLLECTION_NAME = "docs"
@@ -34,8 +37,8 @@ MODEL = os.getenv("OPENAI_MODEL", "nvidia/nemotron-3.5-super-vl:free")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 API_KEY = os.getenv("OPENAI_API_KEY")
 
-RETRIEVAL_K = 20   # how many chunks to fetch from the database per search
-FINAL_K = 10       # how many chunks to give to the LLM at the end
+RETRIEVAL_K = 20   # chunks to fetch from the database per search
+FINAL_K = 10       # chunks to give to the LLM at the end
 
 llm = ChatOpenAI(
     model=MODEL,
@@ -127,12 +130,8 @@ These restrictions always take priority.
 ## Knowledge Base Context:
 {context}
 
-## User Question:
-{question}
-
 Provide your response according to the rules above.
 """
-
 
 RERANK_PROMPT = """
 You are a document re-ranker.
@@ -142,27 +141,11 @@ You must rank order the provided chunks by relevance to the question, with the m
 Reply only with the list of ranked chunk ids, nothing else. Include all the chunk ids you are provided with, reranked.
 """
 
-REWRITE_PROMPT = """
-You are in a conversation with a user.
-You are about to look up information in a Knowledge Base to answer the user's question.
+REWRITE_SYSTEM_PROMPT = """You are an expert search query rewriter for an insurance Knowledge Base.
+Given the conversation history and a user's latest question, rewrite it into a single contextually-rich, specific search query to look up in the Knowledge Base.
+Condense everything in a single, short, specific query most likely to surface content.
+Do NOT answer the question. Reply ONLY with the precise knowledgebase query, nothing else."""
 
-This is the history of your conversation so far with the user:
-{history}
-
-And this is the user's current question:
-{question}
-
-Since the conversation is contextual, understand the meaning of the user question and add details based on the history.
-Condense everything in a single contextually-rich VERY short and specific question, most likely to surface content.
-
-EXAMPLE:
-user: Who is the founder? -> Query: who is the founder?
-assistant: The founder is FooBar
-user: What role covers? -> Query: What role FooBar covers?
-...
-
-IMPORTANT: Respond ONLY with the precise knowledgebase query, nothing else.
-"""
 
 class RankOrder(BaseModel):
     order: list[int] = Field(
@@ -170,75 +153,48 @@ class RankOrder(BaseModel):
     )
 
 
-def format_history(history):
-    """Format history into a clean dialogue string for prompts."""
-    if not history:
-        return ""
-    if isinstance(history, str):
-        return history
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    lines = []
+def to_messages(history) -> list[BaseMessage]:
+    """Convert raw dict history or message list into LangChain BaseMessage objects."""
+    if not history:
+        return []
+    messages = []
     for item in history:
         if isinstance(item, dict):
             role = item.get("role", "user")
             content = item.get("content", "")
-            lines.append(f"{role}: {content}")
-        elif isinstance(item, HumanMessage):
-            lines.append(f"user: {item.content}")
-        elif isinstance(item, AIMessage):
-            lines.append(f"assistant: {item.content}")
-    return "\n".join(lines)
-
-
-def rewrite_query(question, history=None):
-    """Make the question short and clear, using the chat history."""
-    if history is None:
-        history = []
-
-    history_text = format_history(history)
-
-    # Put the history and the question into the prompt
-    prompt = REWRITE_PROMPT.format(history=history_text, question=question)
-
-    # Ask the LLM
-    response = llm.invoke([SystemMessage(content=prompt)])
-
-    # response.content is the text answer
-    return response.content
-
-
-def fetch_context_unranked(question):
-    """Search the database and return the top matching chunks."""
-    # Each chunk is a LangChain "Document" with .page_content and .metadata
-    chunks = vectorstore.similarity_search(question, k=RETRIEVAL_K)
-    return chunks
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        elif isinstance(item, BaseMessage):
+            messages.append(item)
+    return messages
 
 
 def merge_chunks(chunks, other_chunks):
-    """Join two lists of chunks, but skip chunks we already have."""
+    """Join two lists of chunks, skipping duplicates."""
     merged = list(chunks)
+    seen_texts = {chunk.page_content for chunk in chunks}
 
-    # Remember the texts we already have
-    seen_texts = []
-    for chunk in chunks:
-        seen_texts.append(chunk.page_content)
-
-    # Add only new chunks
     for chunk in other_chunks:
         if chunk.page_content not in seen_texts:
             merged.append(chunk)
+            seen_texts.add(chunk.page_content)
 
     return merged
 
 
 def rerank(question, chunks):
-    """Ask the LLM to sort the chunks, most relevant first."""
+    """Ask the LLM to sort the chunks by relevance, most relevant first."""
     if not chunks:
         return []
     if len(chunks) == 1:
         return chunks
 
-    # Build the text that lists all the chunks with ids (1, 2, 3 ...)
     user_prompt = f"The user has asked the following question:\n\n{question}\n\n"
     user_prompt += "Order all the chunks of text by relevance to the question, from most relevant to least relevant. "
     user_prompt += "Include all the chunk ids you are provided with, reranked.\n\n"
@@ -250,9 +206,7 @@ def rerank(question, chunks):
     user_prompt += "Reply only with the list of ranked chunk ids, nothing else."
 
     try:
-        # This makes the LLM reply in the RankOrder shape (a list of numbers)
         structured_llm = llm.with_structured_output(RankOrder)
-
         result = structured_llm.invoke(
             [
                 SystemMessage(content=RERANK_PROMPT),
@@ -260,16 +214,14 @@ def rerank(question, chunks):
             ]
         )
 
-        # Turn the ids back into chunks.
-        # Small safety check: skip ids that are wrong or repeated.
         reranked = []
-        used_ids = []
+        used_ids = set()
         for chunk_id in result.order:
             if 1 <= chunk_id <= len(chunks) and chunk_id not in used_ids:
                 reranked.append(chunks[chunk_id - 1])
-                used_ids.append(chunk_id)
+                used_ids.add(chunk_id)
 
-        # If the LLM forgot some chunks, add them at the end so nothing is lost
+        # Add any missed chunks at the end so nothing is lost
         for i in range(len(chunks)):
             if (i + 1) not in used_ids:
                 reranked.append(chunks[i])
@@ -280,67 +232,107 @@ def rerank(question, chunks):
         return chunks
 
 
-def fetch_context(original_question, history=None):
-    """Find the best chunks for the question."""
-    rewritten_question = rewrite_query(original_question, history)
-    print("Rewritten question:", rewritten_question)
+def fetch_context_unranked(question):
+    """Search the vector database and return matching chunks."""
+    return vectorstore.similarity_search(question, k=RETRIEVAL_K)
+
+
+def fetch_context(original_question, rewritten_question=None):
+    """Retrieve unranked chunks for original + rewritten query, merge, and rerank."""
+    if not rewritten_question:
+        rewritten_question = original_question
 
     chunks1 = fetch_context_unranked(original_question)
     chunks2 = fetch_context_unranked(rewritten_question)
 
-    chunks = merge_chunks(chunks1, chunks2)
-    reranked = rerank(original_question, chunks)
+    merged = merge_chunks(chunks1, chunks2)
+    reranked = rerank(original_question, merged)
 
     return reranked[:FINAL_K]
 
 
-def make_rag_messages(question, history, chunks):
-    """Build the list of messages we send to the LLM."""
-    context = ""
+def format_context_for_prompt(chunks):
+    """Format chunks into a clean context string for the system prompt."""
+    context_str = ""
     for chunk in chunks:
-        context += f"Extract from {chunk.metadata['source']}:\n{chunk.page_content}\n\n"
+        source = chunk.metadata.get("source", "unknown")
+        context_str += f"Extract from {source}:\n{chunk.page_content}\n\n"
+    return context_str
 
-    system_text = SYSTEM_PROMPT.format(context=context, question=question)
 
-    messages = [SystemMessage(content=system_text)]
-    if history:
-        for item in history:
-            if isinstance(item, dict):
-                if item.get("role") == "user":
-                    messages.append(HumanMessage(content=item.get("content", "")))
-                elif item.get("role") == "assistant":
-                    messages.append(AIMessage(content=item.get("content", "")))
-            elif isinstance(item, (HumanMessage, AIMessage, SystemMessage)):
-                messages.append(item)
+# ---------------------------------------------------------------------------
+# LCEL Chains (LangChain Expression Language)
+# ---------------------------------------------------------------------------
 
-    messages.append(HumanMessage(content=question))
+# 1. Query Rewrite Sub-Chain
+rewrite_prompt = ChatPromptTemplate.from_messages([
+    ("system", REWRITE_SYSTEM_PROMPT),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
 
-    return messages
+rewrite_chain = rewrite_prompt | llm | StrOutputParser()
 
+
+# 2. Final RAG Generation Prompt
+rag_prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM_PROMPT),
+    MessagesPlaceholder(variable_name="history"),
+    ("human", "{question}"),
+])
+
+
+# 3. Master LCEL Chain with Sources
+# Orchestrates: Normalization -> Rewrite -> Dual Retrieval & Rerank -> Prompt -> LLM -> Output
+rag_chain_with_sources = (
+    RunnablePassthrough.assign(
+        history=RunnableLambda(lambda x: to_messages(x.get("history", [])))
+    )
+    | RunnablePassthrough.assign(
+        rewritten_question=rewrite_chain
+    )
+    | RunnablePassthrough.assign(
+        chunks=RunnableLambda(lambda x: fetch_context(x["question"], x["rewritten_question"]))
+    )
+    | RunnablePassthrough.assign(
+        context=RunnableLambda(lambda x: format_context_for_prompt(x["chunks"]))
+    )
+    | RunnablePassthrough.assign(
+        answer=(rag_prompt | llm | StrOutputParser())
+    )
+)
+
+# 4. Standard streamable / invokable chain that outputs the answer string directly
+rag_chain = rag_chain_with_sources | RunnableLambda(lambda x: x["answer"])
+
+
+# ---------------------------------------------------------------------------
+# Public API Function (Maintains 100% backward compatibility with api/main.py)
+# ---------------------------------------------------------------------------
 
 def answer_question(question, history=None):
     """
-    Answer a question using RAG.
-    If `history` list is provided, it is updated in-place with user and assistant turns.
+    Answer a question using the LCEL RAG pipeline.
+    Maintains exact signature and behavior expected by api/main.py and eval scripts.
     Returns: (answer text, list of chunks used)
     """
     if history is None:
         history = []
 
-    # 1. Get the best chunks
-    chunks = fetch_context(question, history)
+    # Run through the LCEL chain
+    result = rag_chain_with_sources.invoke({
+        "question": question,
+        "history": history,
+    })
 
-    # 2. Build the messages
-    messages = make_rag_messages(question, history, chunks)
+    answer = result["answer"]
+    chunks = result["chunks"]
 
-    # 3. Ask the LLM
-    response = llm.invoke(messages)
-
-    # 4. Record current turn in history
+    # Record current turn in history list
     history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": response.content})
+    history.append({"role": "assistant", "content": answer})
 
-    return response.content, chunks
+    return answer, chunks
 
 
 if __name__ == "__main__":
