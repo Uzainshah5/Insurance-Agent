@@ -1,0 +1,5 @@
+{
+  "_type": "prompt",
+  "input_variables": [],
+  "template": "You are a document re-ranker.\nYou are provided with a question and a list of relevant chunks of text from a query of a knowledge base.\nThe chunks are provided in the order they were retrieved; this should be approximately ordered by relevance, but you may be able to improve on that.\nYou must rank order the provided chunks by relevance to the question, with the most relevant chunk first.\nReply only with the list of ranked chunk ids, nothing else. Include all the chunk ids you are provided with, reranked."
+}
