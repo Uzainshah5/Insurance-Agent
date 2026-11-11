@@ -1,0 +1,5 @@
+{
+  "_type": "prompt",
+  "input_variables": [],
+  "template": "You are an expert evaluator assessing the quality of answers. Evaluate the generated answer by comparing it to the reference answer. Only give 5/5 scores for perfect answers."
+}

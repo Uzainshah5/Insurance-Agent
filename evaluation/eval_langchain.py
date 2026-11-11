@@ -47,6 +47,7 @@ from pydantic import BaseModel, Field
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import load_prompt
 
 from evaluation.test import TestQuestion, load_tests
 from implementation.answer import answer_question, fetch_context
@@ -196,7 +197,11 @@ def evaluate_retrieval(test, k=10):
 
 # Step 5: Answer evaluation (LLM as a judge)
 
-JUDGE_SYSTEM_PROMPT = "You are an expert evaluator assessing the quality of answers. Evaluate the generated answer by comparing it to the reference answer. Only give 5/5 scores for perfect answers."
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+JUDGE_SYSTEM_PROMPT_TEMPLATE = load_prompt(str(PROMPTS_DIR / "judge_system_prompt.json"))
+JUDGE_PROMPT_TEMPLATE = load_prompt(str(PROMPTS_DIR / "judge_prompt.json"))
+
+JUDGE_SYSTEM_PROMPT = JUDGE_SYSTEM_PROMPT_TEMPLATE.template
 
 
 def evaluate_answer(test):
@@ -207,22 +212,12 @@ def evaluate_answer(test):
     # 1. Get the answer from the RAG code
     generated_answer, retrieved_docs = answer_question(test.question)
 
-    # 2. Build the prompt for the judge
-    judge_prompt = f"""Question:
-{test.question}
-
-Generated Answer:
-{generated_answer}
-
-Reference Answer:
-{test.reference_answer}
-
-Please evaluate the generated answer on three dimensions:
-1. Accuracy: How factually correct is it compared to the reference answer? Only give 5/5 scores for perfect answers.
-2. Completeness: How thoroughly does it address all aspects of the question, covering all the information from the reference answer?
-3. Relevance: How well does it directly answer the specific question asked, giving no additional information?
-
-Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each dimension. If the answer is wrong, then the accuracy score must be 1."""
+    # 2. Build the prompt for the judge via loaded template
+    judge_prompt = JUDGE_PROMPT_TEMPLATE.format(
+        question=test.question,
+        generated_answer=generated_answer,
+        reference_answer=test.reference_answer,
+    )
 
     # 3. Ask the judge. It replies in the AnswerEval shape.
     judge_llm = llm.with_structured_output(AnswerEval)

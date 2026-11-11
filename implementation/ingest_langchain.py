@@ -43,6 +43,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
+from langchain_core.prompts import load_prompt
 
 
 # 
@@ -137,32 +138,24 @@ def fetch_documents():
     return documents
 
 
+# ---------------------------------------------------------------------------
+# Load Prompts via LangChain PromptTemplate JSON
+# ---------------------------------------------------------------------------
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+CHUNKING_PROMPT_TEMPLATE = load_prompt(str(PROMPTS_DIR / "chunking_prompt.json"))
+
+
 def make_prompt(document):
     """Build the prompt that tells the LLM how to split one document."""
     # A rough idea of how many chunks we want
     how_many = (len(document["text"]) // AVERAGE_CHUNK_SIZE) + 1
 
-    return f"""
-You take a document and you split the document into overlapping chunks for a KnowledgeBase.
-
-The document is from the shared drive of a company called Insurellm.
-The document is of type: {document["type"]}
-The document has been retrieved from: {document["source"]}
-
-A chatbot will use these chunks to answer questions about the company.
-You should divide up the document as you see fit, being sure that the entire document is returned across the chunks - don't leave anything out.
-This document should probably be split into at least {how_many} chunks, but you can have more or less as appropriate, ensuring that there are individual chunks to answer specific questions.
-There should be overlap between the chunks as appropriate; typically about 25% overlap or about 50 words, so you have the same text in multiple chunks for best retrieval results.
-
-For each chunk, you should provide a headline, a summary, and the original text of the chunk.
-Together your chunks should represent the entire document with overlap.
-
-Here is the document:
-
-{document["text"]}
-
-Respond with the chunks.
-"""
+    return CHUNKING_PROMPT_TEMPLATE.format(
+        type=document["type"],
+        source=document["source"],
+        how_many=how_many,
+        text=document["text"],
+    )
 
 
 def split_document_sections(document, max_chars=800, overlap=150):

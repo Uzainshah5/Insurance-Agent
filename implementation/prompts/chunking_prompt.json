@@ -1,0 +1,10 @@
+{
+  "_type": "prompt",
+  "input_variables": [
+    "type",
+    "source",
+    "how_many",
+    "text"
+  ],
+  "template": "You take a document and you split the document into overlapping chunks for a KnowledgeBase.\n\nThe document is from the shared drive of a company called Insurellm.\nThe document is of type: {type}\nThe document has been retrieved from: {source}\n\nA chatbot will use these chunks to answer questions about the company.\nYou should divide up the document as you see fit, being sure that the entire document is returned across the chunks - don't leave anything out.\nThis document should probably be split into at least {how_many} chunks, but you can have more or less as appropriate, ensuring that there are individual chunks to answer specific questions.\nThere should be overlap between the chunks as appropriate; typically about 25% overlap or about 50 words, so you have the same text in multiple chunks for best retrieval results.\n\nFor each chunk, you should provide a headline, a summary, and the original text of the chunk.\nTogether your chunks should represent the entire document with overlap.\n\nHere is the document:\n\n{text}\n\nRespond with the chunks."
+}
